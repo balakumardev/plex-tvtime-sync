@@ -19,6 +19,11 @@ EPISODE_SIDECAR = (
 )
 SEARCH_SIDECAR = APP + "/sidecar?o=https://search.tvtime.com/v1/search/series,movie&q={q}&offset=0&limit=5"
 MOVIE_SIDECAR = APP + "/sidecar?o=https://msapi.tvtime.com/prod/v1/tracking/{uuid}/watch"
+MINT_SIDECAR = (
+    APP
+    + "/sidecar?o_b64=aHR0cHM6Ly9hcGkyLnRvemVsYWJzLmNvbS92Mi91c2Vy"
+    + "&lang=en&country_code=us&source=web&version=2025082201"
+)  # o_b64 decodes to https://api2.tozelabs.com/v2/user - mints an anonymous account + bootstrap JWT
 BACKOFF_SECONDS = 3600
 
 
@@ -108,6 +113,26 @@ class TVTimeClient:
         self.tokens["jwt_refresh_token"] = data.get("jwt_refresh_token", rt)
         self._save_tokens()
 
+    def mint_bootstrap_jwt(self) -> str:
+        """Mint an anonymous bootstrap JWT (no auth, no body). Replaces the manual browser step."""
+        try:
+            r = requests.post(MINT_SIDECAR, timeout=self.timeout)
+        except requests.RequestException as e:
+            raise TVTimeAuthError(f"bootstrap mint failed: {e}") from e
+        if r.status_code != 200:
+            raise TVTimeAuthError(f"bootstrap mint rejected: HTTP {r.status_code}")
+        try:
+            token = (r.json() or {}).get("jwt_token")  # NOTE: top-level, not under "data"
+        except ValueError as e:
+            raise TVTimeAuthError(f"bootstrap mint returned non-JSON: {e}") from e
+        if not token:
+            raise TVTimeAuthError("bootstrap mint response missing jwt_token")
+        return token
+
+    def relogin(self) -> None:
+        """Full automatic re-auth: mint an anonymous JWT, exchange it with stored credentials."""
+        self.login_with_bootstrap(self.mint_bootstrap_jwt())
+
     # ---- request plumbing ----
     def _headers(self) -> dict:
         if not self.tokens.get("jwt_token"):
@@ -120,13 +145,23 @@ class TVTimeClient:
     def _body(self) -> dict:
         return {"username": self.username, "password": self.password}
 
-    def _post(self, url: str) -> requests.Response:
-        r = requests.post(url, json=self._body(), headers=self._headers(), timeout=self.timeout)
+    def _authed(self, send) -> requests.Response:
+        """Run a request; on 401 refresh (or fully re-login) once, then retry."""
+        r = send()
         if r.status_code == 401:
-            self.try_refresh()  # raises TVTimeAuthError if unrecoverable
-            r = requests.post(url, json=self._body(), headers=self._headers(), timeout=self.timeout)
+            try:
+                self.try_refresh()
+            except TVTimeAuthError:
+                self.relogin()  # raises TVTimeAuthError if mint/credentials fail
+            r = send()
             if r.status_code == 401:
-                raise TVTimeAuthError("still 401 after token refresh")
+                raise TVTimeAuthError("still 401 after refresh and re-login")
+        return r
+
+    def _post(self, url: str) -> requests.Response:
+        r = self._authed(
+            lambda: requests.post(url, json=self._body(), headers=self._headers(), timeout=self.timeout)
+        )
         if r.status_code >= 400:
             raise TVTimeError(f"HTTP {r.status_code}: {r.text[:300]}")
         return r
@@ -136,9 +171,9 @@ class TVTimeClient:
         self._post(EPISODE_SIDECAR.format(eid=tvdb_episode_id, rw=1 if rewatch else 0))
 
     def search_movie_uuid(self, query: str) -> str | None:
-        r = requests.get(SEARCH_SIDECAR.format(q=query), headers=self._headers(), timeout=self.timeout)
-        if r.status_code == 401:
-            raise TVTimeAuthError("401 on movie search")
+        r = self._authed(
+            lambda: requests.get(SEARCH_SIDECAR.format(q=query), headers=self._headers(), timeout=self.timeout)
+        )
         if r.status_code >= 400:
             raise TVTimeError(f"search HTTP {r.status_code}")
         try:

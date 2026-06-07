@@ -7,6 +7,7 @@ import responses
 from plex_tvtime_sync.tvtime_client import (
     EPISODE_SIDECAR,
     LOGIN_SIDECAR,
+    MINT_SIDECAR,
     MOVIE_SIDECAR,
     REFRESH_SIDECAR,
     SEARCH_SIDECAR,
@@ -153,3 +154,46 @@ def test_search_non_json_raises_tvtime_error(tmp_path):
     c = make_client(tmp_path, {"jwt_token": "JWT1"})
     with pytest.raises(TVTimeError):
         c.search_movie_uuid("603")
+
+
+@responses.activate
+def test_mint_bootstrap_jwt_no_auth_no_body(tmp_path):
+    responses.post(MINT_SIDECAR, json={"id": "1", "jwt_token": "BOOT.JWT", "jwt_refresh_token": "R"})
+    c = make_client(tmp_path)
+    assert c.mint_bootstrap_jwt() == "BOOT.JWT"
+    req = responses.calls[0].request
+    assert "Authorization" not in req.headers
+    assert not req.body
+
+
+@responses.activate
+def test_mint_rejected_raises_auth_error(tmp_path):
+    responses.post(MINT_SIDECAR, status=403)
+    c = make_client(tmp_path)
+    with pytest.raises(TVTimeAuthError):
+        c.mint_bootstrap_jwt()
+
+
+@responses.activate
+def test_401_with_dead_refresh_full_relogin_recovers(tmp_path):
+    url = EPISODE_SIDECAR.format(eid="1", rw=0)
+    responses.post(url, status=401)
+    responses.post(REFRESH_SIDECAR, status=404)  # refresh endpoint dead
+    responses.post(MINT_SIDECAR, json={"jwt_token": "BOOT2"})
+    responses.post(LOGIN_SIDECAR, json={"data": {"jwt_token": "JWT3", "jwt_refresh_token": "RT3"}})
+    responses.post(url, json={"result": "OK"})
+    c = make_client(tmp_path, {"jwt_token": "OLD", "jwt_refresh_token": "RT1"})
+    c.mark_episode("1")
+    saved = json.loads((tmp_path / "tokens.json").read_text())
+    assert saved == {"jwt_token": "JWT3", "jwt_refresh_token": "RT3"}
+    login_call = responses.calls[3].request
+    assert login_call.headers["Authorization"] == "Bearer BOOT2"
+
+
+@responses.activate
+def test_search_401_heals_via_refresh(tmp_path):
+    responses.get(SEARCH_SIDECAR.format(q="603"), status=401)
+    responses.post(REFRESH_SIDECAR, json={"data": {"jwt_token": "JWT2"}})
+    responses.get(SEARCH_SIDECAR.format(q="603"), json={"data": [{"type": "movie", "uuid": "M-1"}]})
+    c = make_client(tmp_path, {"jwt_token": "OLD", "jwt_refresh_token": "RT1"})
+    assert c.search_movie_uuid("603") == "M-1"
