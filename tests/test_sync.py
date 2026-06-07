@@ -180,3 +180,89 @@ def test_per_run_cap_and_oldest_first(tmp_path):
                  state=state, sleep=lambda s: None)
     assert len(tvtime.episodes) == 50
     assert tvtime.episodes[0][0] == "9000"  # oldest first
+
+
+def test_movie_search_no_result_permanent_skip(tmp_path):
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime(search_result=None)
+    movie = MediaItem(type="movie", guids={"tvdb": "77"}, title="Obscure Film")
+    entry = HistoryEntry(rating_key="303", viewed_at=2200, account_id=1, title="Obscure Film", type="movie")
+    sync_mod.run(plex=FakePlex(history=[entry], meta={"303": movie}), tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.movies == []
+    assert json.loads((tmp_path / "state.json").read_text())["watermark"] == 2200
+
+
+def test_plex_error_on_metadata_is_transient(tmp_path):
+    from plex_tvtime_sync.plex_client import PlexError
+
+    class ErroringPlex(FakePlex):
+        def metadata(self, rating_key):
+            raise PlexError("non-XML response")
+
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sync_mod.run(plex=ErroringPlex(history=[ep_entry()]), tvtime=tvtime, state=state,
+                 sleep=lambda s: None)
+    assert tvtime.episodes == []
+    assert json.loads((tmp_path / "state.json").read_text())["watermark"] == 1000
+
+
+def test_mixed_batch_persists_prefix_on_transient_failure(tmp_path):
+    state = seeded_state(tmp_path)
+
+    class FlakyTVTime(FakeTVTime):
+        def mark_episode(self, eid, rewatch=False):
+            if eid == "9001":
+                raise TVTimeError("503")
+            super().mark_episode(eid, rewatch)
+
+    history = [ep_entry(rk=str(100 + i), viewed=2000 + i) for i in range(3)]
+    meta = {str(100 + i): ep_item(tvdb=str(9000 + i)) for i in range(3)}
+    tvtime = FlakyTVTime()
+    sync_mod.run(plex=FakePlex(history=history, meta=meta), tvtime=tvtime, state=state,
+                 sleep=lambda s: None)
+    assert [e[0] for e in tvtime.episodes] == ["9000"]
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["watermark"] == 2000  # advanced past item 1 only
+    assert "100:2000" in saved["processed"]
+    assert "101:2001" not in saved["processed"]
+
+
+def test_auth_error_on_movie_search_sets_backoff(tmp_path):
+    state = seeded_state(tmp_path)
+
+    class AuthFailSearch(FakeTVTime):
+        def search_movie_uuid(self, q):
+            raise TVTimeAuthError("401 on movie search")
+
+    movie = MediaItem(type="movie", guids={"tvdb": "77"}, title="M")
+    entry = HistoryEntry(rating_key="404", viewed_at=2300, account_id=1, title="M", type="movie")
+    tvtime = AuthFailSearch()
+    sync_mod.run(plex=FakePlex(history=[entry], meta={"404": movie}), tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.backoff_set is True
+    assert json.loads((tmp_path / "state.json").read_text())["watermark"] == 1000
+
+
+def test_unexpected_error_logged_and_stops_cleanly(tmp_path):
+    state = seeded_state(tmp_path)
+
+    class ExplodingTVTime(FakeTVTime):
+        def mark_episode(self, eid, rewatch=False):
+            raise TypeError("boom")
+
+    tvtime = ExplodingTVTime()
+    rc = sync_mod.run(plex=FakePlex(history=[ep_entry()], meta={"101": ep_item()}),
+                      tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert rc == 0  # crash contained, run ends cleanly
+    assert json.loads((tmp_path / "state.json").read_text())["watermark"] == 1000
+
+
+def test_other_account_history_ignored(tmp_path):
+    state = seeded_state(tmp_path)
+    other = HistoryEntry(rating_key="500", viewed_at=2400, account_id=7, title="Not mine", type="episode")
+    tvtime = FakeTVTime()
+    sync_mod.run(plex=FakePlex(history=[other], meta={"500": ep_item()}), tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == []

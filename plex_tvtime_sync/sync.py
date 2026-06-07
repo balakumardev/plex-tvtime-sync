@@ -6,7 +6,7 @@ import time
 import requests
 
 from . import config as config_mod
-from .plex_client import PlexClient, PlexNotFound
+from .plex_client import OWNER_ACCOUNT_ID, PlexClient, PlexNotFound
 from .state import OVERLAP_SECONDS, State
 from .tvtime_client import TVTimeAuthError, TVTimeClient, TVTimeError
 
@@ -35,12 +35,18 @@ def run(cfg=None, plex=None, tvtime=None, state=None, sleep=time.sleep) -> int:
     try:
         entries = plex.recent_history()
     except Exception as e:  # Plex down: quiet no-op, watermark untouched
-        log.error("plex unreachable: %s", e)
+        log.error("plex history fetch failed: %s", e)
         return 0
 
     cutoff = state.watermark - OVERLAP_SECONDS
     todo = sorted(
-        (e for e in entries if e.viewed_at >= cutoff and not state.is_processed(e.dedup_key)),
+        (
+            e
+            for e in entries
+            if e.viewed_at >= cutoff
+            and e.account_id == OWNER_ACCOUNT_ID
+            and not state.is_processed(e.dedup_key)
+        ),
         key=lambda e: e.viewed_at,
     )[:MAX_ITEMS_PER_RUN]
 
@@ -91,6 +97,9 @@ def run(cfg=None, plex=None, tvtime=None, state=None, sleep=time.sleep) -> int:
             break
         except (TVTimeError, requests.RequestException) as e:
             log.error("tvtime transient error on %s: %s - retrying next run", item.label(), e)
+            break
+        except Exception:
+            log.exception("unexpected error on %s - stopping run", entry.rating_key)
             break
 
     state.save()

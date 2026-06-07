@@ -16,6 +16,9 @@ class PlexNotFound(Exception):
     pass
 
 
+OWNER_ACCOUNT_ID = 1  # Plex server owner is always account 1; this tool is owner-only.
+
+
 @dataclass
 class HistoryEntry:
     rating_key: str
@@ -61,8 +64,7 @@ class PlexClient:
         except ET.ParseError as e:
             raise PlexError(f"non-XML response from {path}: {e}") from e
 
-    # account_id=1 is always the Plex server owner; this tool is deliberately owner-only.
-    def recent_history(self, account_id: int = 1, limit: int = 200) -> list[HistoryEntry]:
+    def recent_history(self, account_id: int = OWNER_ACCOUNT_ID, limit: int = 200) -> list[HistoryEntry]:
         """Most recent view events, newest first. Entries without ratingKey (deleted items
         whose metadata is gone) are skipped — they cannot be resolved to GUIDs anyway."""
         root = self._get(
