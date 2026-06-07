@@ -164,9 +164,17 @@ def run(cfg=None, plex=None, tvtime=None, state=None, sleep=time.sleep) -> int:
         except Exception as e:
             log.error("excluded-library resolution failed (%s) - skipping run to stay fail-closed", e)
             return 0
-        excluded_ids = {
-            sections[title]["key"] for title in cfg.excluded_libraries if title in sections
-        }
+        # Match titles case-insensitively (and trimmed) so a "private" vs "Private" slip
+        # never silently fails open and leaks a section. Every configured name that
+        # resolves to no section is almost certainly a typo: warn loudly (the guardrail)
+        # but stay fail-open — fail-closed already covers an actual sections() failure.
+        by_lower = {title.lower(): meta["key"] for title, meta in sections.items()}
+        for title in cfg.excluded_libraries:
+            key = by_lower.get(title.strip().lower())
+            if key is None:
+                log.warning("excluded library %r does not match any Plex library - check spelling", title)
+            else:
+                excluded_ids.add(key)
 
     cutoff = state.watermark - OVERLAP_SECONDS
     todo = sorted(
@@ -212,6 +220,20 @@ def run(cfg=None, plex=None, tvtime=None, state=None, sleep=time.sleep) -> int:
 _SCAN_TYPE = {"show": 4, "movie": 1}
 
 
+def _same_recent_view(state, entry) -> bool:
+    """A scan hit within OVERLAP_SECONDS of an already-processed view of the same
+    item is the same playback seen through a second lens: Plex writes the item's
+    lastViewedAt and the history row's viewedAt in separate operations, so the
+    two timestamps can differ by a second or two. Without this check the scan
+    would re-mark the playback as a phantom rewatch. A genuine rewatch of the
+    same item cannot complete within the overlap window."""
+    prefix = f"{entry.rating_key}:"
+    for key, ts in state.processed.items():
+        if key.startswith(prefix) and abs(ts - entry.viewed_at) <= OVERLAP_SECONDS:
+            return True
+    return False
+
+
 def _scan_pass(plex, tvtime, state, cutoff, excluded_ids, get_sections,
                mark_previous, show_tvdb_cache, sleep, marked_count) -> None:
     """Second detection pass: items whose lastViewedAt was bumped by a manual mark-watched
@@ -236,17 +258,22 @@ def _scan_pass(plex, tvtime, state, cutoff, excluded_ids, get_sections,
         except Exception as e:
             log.error("scan: section %s (%s) fetch failed (%s) - skipping section", title, sect_key, e)
             continue
-        candidates = sorted(
-            (
-                e
-                for e in viewed
-                # A normal playback sets lastViewedAt == the history viewedAt, so the scan
-                # sees that ratingKey:lastViewedAt as already processed and skips it here.
-                # That equality is exactly what prevents the scan from double-marking.
-                if e.viewed_at >= cutoff and not state.is_processed(e.dedup_key)
-            ),
-            key=lambda e: e.viewed_at,
-        )
+        # A normal playback usually sets lastViewedAt == the history viewedAt, so the
+        # scan sees that ratingKey:lastViewedAt as already processed and skips it. That
+        # equality is the common case; the epsilon check below (_same_recent_view) covers
+        # the skew where Plex writes lastViewedAt a second or two off from the history row.
+        candidates = []
+        for e in viewed:
+            if e.viewed_at < cutoff or state.is_processed(e.dedup_key):
+                continue
+            if _same_recent_view(state, e):
+                # Same playback as an already-marked view, just timestamp-skewed. Record
+                # the skewed key so future runs dedup it cheaply, then skip with no TV
+                # Time call and no ledger write — it is not a rewatch.
+                state.mark_processed(e.dedup_key, e.viewed_at)
+                continue
+            candidates.append(e)
+        candidates.sort(key=lambda e: e.viewed_at)
         for entry in candidates:
             if marked_count >= MAX_ITEMS_PER_RUN:
                 return

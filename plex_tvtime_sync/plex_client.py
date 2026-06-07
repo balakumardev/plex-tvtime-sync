@@ -113,7 +113,10 @@ class PlexClient:
 
     def recently_viewed(self, section_id: str, plex_type: int, limit: int = 100) -> list[HistoryEntry]:
         """Most recently viewed items in a section (manual marks included), newest first.
-        plex_type: 4 = episodes, 1 = movies. lastViewedAt stands in for viewedAt."""
+        plex_type: 4 = episodes, 1 = movies. lastViewedAt stands in for viewedAt — it
+        usually equals the history row's viewedAt for a real playback, but Plex writes the
+        two in separate operations so they can differ by a second or two (the scan pass
+        dedups that skew with an epsilon window, see sync._same_recent_view)."""
         root = self._get(
             f"/library/sections/{section_id}/all",
             **{

@@ -385,6 +385,37 @@ def test_excluded_name_not_in_sections_is_ignored(tmp_path):
     assert tvtime.episodes == [("349232", False)]
 
 
+def test_excluded_library_match_is_case_insensitive(tmp_path):
+    """Config "private" (lowercase) must exclude the "Private" Plex section regardless of
+    case/whitespace, so a name-case mismatch never silently fails open and leaks it."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    private = ep_entry(rk="700", viewed=2050, section_id="9")
+    public = ep_entry(rk="101", viewed=2000, section_id="2")
+    sections = {"Private": {"key": "9", "type": "show"}, "TV Shows": {"key": "2", "type": "show"}}
+    plex = FakePlex(history=[private, public], meta={"101": ep_item(), "700": ep_item(tvdb="999")},
+                    sections=sections)
+    sync_mod.run(cfg=FakeCfg(excluded_libraries=["  private  "]), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]  # only the public one; Private excluded
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert "700:2050" not in saved["processed"]  # excluded item never marked processed
+
+
+def test_excluded_library_no_match_logs_warning_and_proceeds(tmp_path, caplog):
+    """A configured exclusion matching no Plex section is a likely spelling slip: warn
+    loudly (the guardrail), but stay fail-open and let the run proceed."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sections = {"TV Shows": {"key": "2", "type": "show"}}
+    plex = FakePlex(history=[ep_entry(section_id="2")], meta={"101": ep_item()}, sections=sections)
+    with caplog.at_level("WARNING"):
+        sync_mod.run(cfg=FakeCfg(excluded_libraries=["Adlt"]), plex=plex, tvtime=tvtime,
+                     state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]  # run proceeded
+    assert any("Adlt" in r.message and "does not match" in r.message for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # Feature 2: MARK_PREVIOUS_EPISODES
 # ---------------------------------------------------------------------------
@@ -664,3 +695,39 @@ def test_sections_fetched_once_when_both_exclusions_and_scan(tmp_path):
     sync_mod.run(cfg=FakeCfg(excluded_libraries=["Adult"]), plex=plex, tvtime=tvtime,
                  state=state, sleep=lambda s: None)
     assert plex.sections_calls == 1  # reused, not fetched twice
+
+
+# ---------------------------------------------------------------------------
+# Fix C1: lastViewedAt/viewedAt skew must not phantom-rewatch (epsilon dedup)
+# ---------------------------------------------------------------------------
+
+def test_scan_skew_does_not_phantom_rewatch(tmp_path):
+    """Same playback, two timestamps: history viewedAt=2000 but the item's lastViewedAt
+    landed at 2001 (Plex writes them in separate operations). The scan must recognise
+    this as the same view event, not re-mark it as a rewatch."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sections = {"TV Shows": {"key": "2", "type": "show"}}
+    history = [ep_entry(rk="101", viewed=2000, section_id="2")]
+    viewed = {"2": [viewed_entry("101", 2001, "2")]}  # 1s skew vs history row
+    plex = FakePlex(history=history, meta={"101": ep_item()}, sections=sections, viewed=viewed)
+    sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]  # exactly one mark, no phantom rewatch
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert "101:2001" in saved["processed"]  # skewed key remembered for future runs
+
+
+def test_scan_outside_overlap_window_is_genuine_rewatch(tmp_path):
+    """Inverse guard: a scan hit for the same item OUTSIDE the overlap window is a real
+    rewatch and must be marked (rewatch=True), not swallowed by the epsilon dedup."""
+    state = seeded_state(tmp_path, watermark=1000)
+    tvtime = FakeTVTime()
+    sections = {"TV Shows": {"key": "2", "type": "show"}}
+    history = [ep_entry(rk="101", viewed=2000, section_id="2")]
+    later = 2000 + sync_mod.OVERLAP_SECONDS + 10  # comfortably outside the window
+    viewed = {"2": [viewed_entry("101", later, "2")]}
+    plex = FakePlex(history=history, meta={"101": ep_item()}, sections=sections, viewed=viewed)
+    sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False), ("349232", True)]  # first watch + rewatch
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert f"101:{later}" in saved["processed"]
