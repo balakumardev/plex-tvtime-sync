@@ -12,6 +12,7 @@ from plex_tvtime_sync.tvtime_client import (
     SEARCH_SIDECAR,
     TVTimeAuthError,
     TVTimeClient,
+    TVTimeError,
 )
 
 
@@ -113,3 +114,42 @@ def test_backoff_marker_roundtrip(tmp_path):
     assert c.in_backoff() is True
     c.clear_backoff()
     assert c.in_backoff() is False
+
+
+@responses.activate
+def test_mark_calls_send_creds_body(tmp_path):
+    responses.post(EPISODE_SIDECAR.format(eid="7", rw=0), json={"result": "OK"})
+    responses.post(MOVIE_SIDECAR.format(uuid="M-9"), json={"ok": True})
+    c = make_client(tmp_path, {"jwt_token": "JWT1"})
+    c.mark_episode("7")
+    c.mark_movie("M-9")
+    for call in responses.calls:
+        assert json.loads(call.request.body) == {"username": "u@example.com", "password": "pw"}
+
+
+@responses.activate
+def test_refresh_request_shape(tmp_path):
+    responses.post(EPISODE_SIDECAR.format(eid="1", rw=0), status=401)
+    responses.post(REFRESH_SIDECAR, json={"data": {"jwt_token": "JWT2"}})
+    responses.post(EPISODE_SIDECAR.format(eid="1", rw=0), json={"result": "OK"})
+    c = make_client(tmp_path, {"jwt_token": "OLD", "jwt_refresh_token": "RT1"})
+    c.mark_episode("1")
+    refresh_call = responses.calls[1].request
+    assert json.loads(refresh_call.body) == {"refresh_token": "RT1"}
+    assert refresh_call.headers["Authorization"] == "Bearer RT1"
+
+
+@responses.activate
+def test_login_malformed_200_raises_auth_error(tmp_path):
+    responses.post(LOGIN_SIDECAR, json={"data": {}})
+    c = make_client(tmp_path)
+    with pytest.raises(TVTimeAuthError):
+        c.login_with_bootstrap("BOOT")
+
+
+@responses.activate
+def test_search_non_json_raises_tvtime_error(tmp_path):
+    responses.get(SEARCH_SIDECAR.format(q="603"), body="<html>oops</html>")
+    c = make_client(tmp_path, {"jwt_token": "JWT1"})
+    with pytest.raises(TVTimeError):
+        c.search_movie_uuid("603")

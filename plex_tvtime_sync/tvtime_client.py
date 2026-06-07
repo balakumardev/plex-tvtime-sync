@@ -4,6 +4,7 @@
 Endpoint knowledge credit: Zggis/plex-tvtime (reference only) and TheIndra55/tvtime-api.
 """
 import json
+import os
 import time
 from pathlib import Path
 
@@ -56,8 +57,11 @@ class TVTimeClient:
 
     # ---- auth ----
     def _save_tokens(self) -> None:
-        self.tokens_path.write_text(json.dumps(self.tokens))
-        self.tokens_path.chmod(0o600)
+        tmp = self.tokens_path.with_suffix(".json.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(self.tokens))
+        os.replace(tmp, self.tokens_path)
 
     def login_with_bootstrap(self, bootstrap_jwt: str) -> None:
         r = requests.post(
@@ -68,7 +72,12 @@ class TVTimeClient:
         )
         if r.status_code != 200:
             raise TVTimeAuthError(f"login failed: HTTP {r.status_code} {r.text[:300]}")
-        data = r.json()["data"]
+        try:
+            data = (r.json() or {}).get("data") or {}
+        except ValueError as e:
+            raise TVTimeAuthError(f"login returned non-JSON: {e}") from e
+        if "jwt_token" not in data:
+            raise TVTimeAuthError("login response missing jwt_token")
         self.tokens = {
             "jwt_token": data["jwt_token"],
             "jwt_refresh_token": data.get("jwt_refresh_token"),
@@ -132,7 +141,11 @@ class TVTimeClient:
             raise TVTimeAuthError("401 on movie search")
         if r.status_code >= 400:
             raise TVTimeError(f"search HTTP {r.status_code}")
-        for item in r.json().get("data") or []:
+        try:
+            results = r.json().get("data") or []
+        except ValueError as e:
+            raise TVTimeError(f"search returned non-JSON: {e}") from e
+        for item in results:
             if item.get("type") == "movie" and item.get("uuid"):
                 return item["uuid"]
         return None

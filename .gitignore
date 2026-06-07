@@ -7,5 +7,7 @@ config/.env
 config/tokens.json
 config/state.json
 config/ledger.json
+config/auth_backoff
+config/*.tmp
 venv/
 __pycache__/
