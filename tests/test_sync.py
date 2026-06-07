@@ -520,15 +520,22 @@ def test_scan_marks_manually_marked_episode(tmp_path):
     assert ("1", 1) in plex.viewed_calls
 
 
-def test_scan_runs_without_cfg_using_sections(tmp_path):
-    """cfg=None still scans (the scan does not depend on exclusions); sections fetched."""
+def test_scan_does_not_run_with_cfg_none(tmp_path):
+    """Legacy dependency-injection path (cfg=None) keeps prior behavior: no scan pass,
+    no sections() call. Production always passes a real Config, so the scan still runs
+    there. Proven by a FakePlex whose sections() raises if touched."""
+    class NoSectionsPlex(FakePlex):
+        def sections(self):
+            raise AssertionError("sections() must not be called when cfg is None")
+
     state = seeded_state(tmp_path)
     tvtime = FakeTVTime()
-    sections = {"TV Shows": {"key": "2", "type": "show"}}
     viewed = {"2": [viewed_entry("808", 3000, "2")]}
-    plex = FakePlex(history=[], meta={"808": ep_item(tvdb="555")}, sections=sections, viewed=viewed)
+    plex = NoSectionsPlex(history=[], meta={"808": ep_item(tvdb="555")},
+                          sections={"TV Shows": {"key": "2", "type": "show"}}, viewed=viewed)
     sync_mod.run(plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
-    assert tvtime.episodes == [("555", False)]
+    assert tvtime.episodes == []  # scan skipped → manual-mark item not synced under cfg=None
+    assert plex.viewed_calls == []
 
 
 def test_scan_dedups_item_already_marked_by_history(tmp_path):

@@ -196,9 +196,11 @@ def run(cfg=None, plex=None, tvtime=None, state=None, sleep=time.sleep) -> int:
             marked_count += 1
 
     # ---- Pass 2: lastViewedAt scan (manual mark-as-watched) ----
-    # Only when the history pass ran cleanly to completion (no break): a broken history
-    # pass means TV Time/Plex is unhealthy, so don't pile a second pass on top.
-    if not history_stopped:
+    # Runs only when the history pass completed without a transient/auth break (a broken
+    # history pass means TV Time/Plex is unhealthy, so don't pile a second pass on top).
+    # Gated on cfg presence: production always passes a real Config, while the pure
+    # dependency-injection path (cfg=None) stays legacy and never touches sections().
+    if cfg is not None and not history_stopped:
         _scan_pass(plex, tvtime, state, cutoff, excluded_ids, get_sections,
                    mark_previous, show_tvdb_cache, sleep, marked_count)
 
