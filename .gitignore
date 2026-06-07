@@ -1,0 +1,11 @@
+# Re-include docs/ (globally ignored on this machine)
+!docs/
+!docs/**
+
+# Secrets/state never belong in the repo
+config/.env
+config/tokens.json
+config/state.json
+config/ledger.json
+venv/
+__pycache__/
