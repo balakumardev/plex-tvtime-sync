@@ -4,7 +4,7 @@ Sync your Plex watch activity (TV episodes and movies) to [TV Time](https://tvti
 
 ## Why not webhooks?
 
-Plex webhooks have two problems for this job: they require a Plex Pass, and even with one they **never fire for items you mark as watched manually** (only for actual playback). Polling the history endpoint catches everything, playback and manual marks alike. It also self-heals: because the watermark only advances past items that succeed, anything watched while your host or TV Time was unreachable is picked up on the next successful run.
+Plex webhooks require a Plex Pass; polling the history API requires nothing. Polling also self-heals: because the watermark only advances past items that succeed, anything watched while your host or TV Time was unreachable is picked up on the next successful run. Note that Plex's history endpoint records **playback sessions only**: manually marking an item watched does not create a history entry and is deliberately not synced (if you use watched-state for library cleanup automation, those marks will not pollute your TV Time profile).
 
 ## How it works
 
@@ -25,6 +25,7 @@ All TV Time write calls tunnel through TV Time's own CORS sidecar (`/sidecar?o=<
 
 | Purpose | Upstream endpoint |
 |---|---|
+| Anonymous bootstrap mint | `api2.tozelabs.com/v2/user` (zero-auth, zero-body POST; response carries the bootstrap `jwt_token`) |
 | Credential login | `auth.tvtime.com/v1/login` (body `{username, password}`, bearer = bootstrap JWT) |
 | Mark episode watched | `api2.tozelabs.com/v2/watched_episodes/episode/{tvdb_episode_id}?is_rewatch=0|1` |
 | Movie search | `search.tvtime.com/v1/search/series,movie?q={id}&offset=0&limit=5` |
@@ -55,19 +56,17 @@ chmod 600 config/.env
 
 The config directory defaults to `config/` next to the package. Override it with the `PTVS_CONFIG_DIR` environment variable if you keep secrets elsewhere.
 
-## Authenticate with TV Time (one-time, roughly every 60 days)
+## Authenticate with TV Time (one command, zero-touch afterwards)
 
-TV Time has no API key. You bootstrap a session once from a browser, then the tool reuses the resulting tokens. The bootstrap JWT is an **anonymous** token that exists before you log in, so no password is ever typed into any web page:
-
-1. Open `https://app.tvtime.com/welcome?mode=auth` in any browser.
-2. In the DevTools console, run: `localStorage.getItem('flutter.jwtToken')`
-3. Exchange it for account tokens (credentials are read from `config/.env`):
+TV Time has no API key. The tool mints an **anonymous** bootstrap JWT itself (the same zero-auth call the TV Time web app makes on load), then exchanges it with your credentials for account tokens:
 
 ```bash
-./venv/bin/python -m plex_tvtime_sync.bootstrap_login '<bootstrap-jwt>'
+./venv/bin/python -m plex_tvtime_sync.bootstrap_login
 ```
 
-This writes `jwt_token` and `jwt_refresh_token` to `config/tokens.json`. The `jwt_token` lasts roughly 60 days. On an HTTP 401 during sync the tool attempts an automatic refresh; if that fails it logs a line starting with `CRITICAL` and applies a 1-hour backoff (suppressing further TV Time calls and freezing the watermark so nothing is lost). When you see that `CRITICAL` line, rerun the three bootstrap steps above to mint a fresh token.
+This writes `jwt_token` and `jwt_refresh_token` to `config/tokens.json` (mode `0600`). The `jwt_token` lasts roughly 60 days, and expiry is handled automatically: on an HTTP 401 the tool first attempts a token refresh, and if that fails it re-mints an anonymous JWT and logs in again with the stored credentials. No browser, no manual steps. Only if that full re-login fails (for example, a changed password) does it log a line starting with `CRITICAL` and apply a 1-hour backoff (suppressing further TV Time calls and freezing the watermark so nothing is lost).
+
+If the anonymous mint ever stops working, there is a manual fallback: open `https://app.tvtime.com/welcome?mode=auth` in any browser, run `localStorage.getItem('flutter.jwtToken')` in the DevTools console, and pass that value as an argument to `bootstrap_login`.
 
 ## Run on cron
 
@@ -93,6 +92,7 @@ All live in the config directory and are gitignored:
 ## Behavior and limitations
 
 - **Owner account only.** Syncs the Plex server owner (`accountID=1`); managed and shared users are ignored.
+- **Playback only.** Manually marking an item watched in Plex does not create a history entry and is not synced.
 - **Forward-only.** No historical backfill; the watermark starts at the time of the first run.
 - **Rewatches.** A repeat view of something already in the local ledger is sent with `is_rewatch=1`.
 - **Rate-limited.** At most 50 items per run, with at least 1 second between TV Time calls, so a large catch-up never floods the API.

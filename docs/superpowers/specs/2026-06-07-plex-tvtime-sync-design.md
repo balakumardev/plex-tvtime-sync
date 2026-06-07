@@ -1,7 +1,7 @@
 # plex-tvtime-sync — Design
 
 **Date:** 2026-06-07
-**Status:** Approved by user (pending spec review)
+**Status:** Implemented 2026-06-07 (live on whatbox; see Implementation Notes at bottom)
 **Repo:** `balakumardev/plex-tvtime-sync` (public, MIT)
 
 ## Problem
@@ -159,3 +159,25 @@ TV Time endpoint behavior reverse-engineered by the
 [Zggis/plex-tvtime](https://github.com/Zggis/plex-tvtime) project (unlicensed; used as
 reference only) and [TheIndra55/tvtime-api](https://github.com/TheIndra55/tvtime-api) docs.
 This project is an independent Python implementation.
+
+## Implementation Notes (post-build, 2026-06-07)
+
+Deviations and discoveries from the live build, superseding the sections above where they conflict:
+
+1. **Manual mark-as-watched does NOT sync** (design above claimed it would). E2E-verified:
+   `/:/scrobble` does not create `/status/sessions/history/all` entries; that endpoint records
+   playback sessions only. Accepted as correct-for-this-deployment: the owner's pipeline uses
+   watched-state to trigger deletion (PlexCleaner), so marking-to-delete must not pollute TV Time.
+2. **The browser bootstrap step was eliminated.** The web app mints its anonymous JWT via
+   `POST https://app.tvtime.com/sidecar?o_b64=<b64(https://api2.tozelabs.com/v2/user)>&lang=en&country_code=us&source=web&version=2025082201`
+   with no auth and no body; the response carries a TOP-LEVEL `jwt_token` (not `data`-wrapped).
+   `bootstrap_login` now auto-mints with no arguments, and the 401 path self-heals:
+   refresh attempt → full automatic re-login (mint + credentials) → only then CRITICAL + 1 h backoff.
+3. **Movie search uses `limit=5`** and picks the first `type == "movie"` result (table above
+   says `limit=1`); prevents a similarly-named series from shadowing the movie.
+4. **Hardening beyond spec:** atomic JSON writes + corrupt-state recovery (state/ledger/tokens),
+   typed `PlexError` for non-XML responses, client-side owner-account filter (defense in depth),
+   catch-all per-item containment (a poison item stops the run cleanly instead of crashing
+   unlogged), tokens written 0600-from-birth.
+5. The legacy `o=` sidecar form used by the client still works (the web app itself moved to
+   `o_b64=`); if `o=` ever breaks, switch the constants to base64 form.
