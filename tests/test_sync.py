@@ -102,6 +102,12 @@ def show_item(tvdb="349"):
     return MediaItem(type="show", guids=guids, title="Show")
 
 
+def viewed_entry(rk, last_viewed, section_id, type="episode"):
+    """A HistoryEntry as produced by plex.recently_viewed (lastViewedAt scan)."""
+    return HistoryEntry(rating_key=rk, viewed_at=last_viewed, account_id=1,
+                        title="Scanned", type=type, library_section_id=section_id)
+
+
 class FakeCfg:
     """Stand-in for config.Config; only the fields sync.run reads from cfg."""
     def __init__(self, excluded_libraries=None, mark_previous_episodes=False):
@@ -491,3 +497,163 @@ def test_mark_previous_caches_show_resolution_across_binge(tmp_path):
     # grandparent "55" fetched exactly once despite 3 episodes
     assert plex.metadata_calls.count("55") == 1
     assert len(tvtime.previous) == 3  # catch-up fired for each first-watch episode
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: manual mark-as-watched detection (lastViewedAt scan)
+# ---------------------------------------------------------------------------
+
+def test_scan_marks_manually_marked_episode(tmp_path):
+    """An item bumped only via lastViewedAt (no history entry) is synced by the scan pass."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sections = {"TV Shows": {"key": "2", "type": "show"}, "Movies": {"key": "1", "type": "movie"}}
+    viewed = {"2": [viewed_entry("808", 3000, "2")]}
+    plex = FakePlex(history=[], meta={"808": ep_item(tvdb="555")}, sections=sections, viewed=viewed)
+    sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("555", False)]
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["watermark"] == 3000  # scan item advances watermark
+    assert "808:3000" in saved["processed"]
+    # show section scanned with plex_type 4, movie section with plex_type 1
+    assert ("2", 4) in plex.viewed_calls
+    assert ("1", 1) in plex.viewed_calls
+
+
+def test_scan_runs_without_cfg_using_sections(tmp_path):
+    """cfg=None still scans (the scan does not depend on exclusions); sections fetched."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sections = {"TV Shows": {"key": "2", "type": "show"}}
+    viewed = {"2": [viewed_entry("808", 3000, "2")]}
+    plex = FakePlex(history=[], meta={"808": ep_item(tvdb="555")}, sections=sections, viewed=viewed)
+    sync_mod.run(plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("555", False)]
+
+
+def test_scan_dedups_item_already_marked_by_history(tmp_path):
+    """A normal playback sets lastViewedAt == the history viewedAt, so the scan sees the
+    same ratingKey:ts as already processed and does NOT double-mark."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sections = {"TV Shows": {"key": "2", "type": "show"}}
+    # same rk + same ts in both history and scan
+    history = [ep_entry(rk="101", viewed=2000, section_id="2")]
+    viewed = {"2": [viewed_entry("101", 2000, "2")]}
+    plex = FakePlex(history=history, meta={"101": ep_item()}, sections=sections, viewed=viewed)
+    sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]  # marked exactly once (by history pass)
+
+
+def test_scan_skips_excluded_sections(tmp_path):
+    """Excluded libraries are not scanned at all."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sections = {"Adult": {"key": "9", "type": "movie"}, "TV Shows": {"key": "2", "type": "show"}}
+    viewed = {"9": [viewed_entry("700", 3000, "9", type="movie")],
+              "2": [viewed_entry("808", 3100, "2")]}
+    plex = FakePlex(history=[], meta={"808": ep_item(tvdb="555"), "700": ep_item()},
+                    sections=sections, viewed=viewed)
+    sync_mod.run(cfg=FakeCfg(excluded_libraries=["Adult"]), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("555", False)]  # only the non-excluded section item
+    assert "9" not in [c[0] for c in plex.viewed_calls]  # excluded section never scanned
+
+
+def test_scan_skips_non_show_non_movie_sections(tmp_path):
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sections = {"Music": {"key": "3", "type": "artist"}, "Photos": {"key": "4", "type": "photo"}}
+    plex = FakePlex(history=[], sections=sections, viewed={})
+    sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert plex.viewed_calls == []  # neither artist nor photo sections scanned
+
+
+def test_scan_section_fetch_failure_skips_that_section_only(tmp_path):
+    """recently_viewed raising for one section logs + skips it; others still scanned."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sections = {"Broken": {"key": "5", "type": "show"}, "TV Shows": {"key": "2", "type": "show"}}
+
+    class FlakyScanPlex(FakePlex):
+        def recently_viewed(self, section_id, plex_type, limit=100):
+            self.viewed_calls.append((section_id, plex_type))
+            if section_id == "5":
+                raise ConnectionError("section 5 down")
+            return self._viewed.get(section_id, [])
+
+    plex = FlakyScanPlex(history=[], meta={"808": ep_item(tvdb="555")}, sections=sections,
+                         viewed={"2": [viewed_entry("808", 3000, "2")]})
+    rc = sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert rc == 0
+    assert tvtime.episodes == [("555", False)]  # good section still synced
+
+
+def test_scan_respects_cutoff(tmp_path):
+    """Scan items older than watermark - overlap are ignored, same as history."""
+    state = seeded_state(tmp_path, watermark=5000)
+    tvtime = FakeTVTime()
+    sections = {"TV Shows": {"key": "2", "type": "show"}}
+    viewed = {"2": [viewed_entry("808", 100, "2")]}  # ancient
+    plex = FakePlex(history=[], meta={"808": ep_item(tvdb="555")}, sections=sections, viewed=viewed)
+    sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert tvtime.episodes == []
+
+
+def test_scan_does_not_run_when_history_pass_breaks(tmp_path):
+    """If the history loop breaks (transient), the scan pass must not run."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime(fail_with=TVTimeError("503"))
+    sections = {"TV Shows": {"key": "2", "type": "show"}}
+    viewed = {"2": [viewed_entry("808", 3000, "2")]}
+    plex = FakePlex(history=[ep_entry()], meta={"101": ep_item(), "808": ep_item(tvdb="555")},
+                    sections=sections, viewed=viewed)
+    sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert plex.viewed_calls == []  # scan never started
+    assert tvtime.episodes == []  # history mark failed, scan didn't run
+
+
+def test_combined_cap_across_both_passes(tmp_path):
+    """MAX_ITEMS_PER_RUN is a total across history + scan marks."""
+    state = seeded_state(tmp_path)
+    cap = sync_mod.MAX_ITEMS_PER_RUN
+    # history fills 40 marks; scan offers 30 more but only 10 may be taken
+    history = [ep_entry(rk=str(1000 + i), viewed=2000 + i, section_id="2") for i in range(40)]
+    scan = [viewed_entry(str(5000 + i), 4000 + i, "2") for i in range(30)]
+    meta = {str(1000 + i): ep_item(tvdb=str(7000 + i)) for i in range(40)}
+    meta.update({str(5000 + i): ep_item(tvdb=str(8000 + i)) for i in range(30)})
+    sections = {"TV Shows": {"key": "2", "type": "show"}}
+    tvtime = FakeTVTime()
+    plex = FakePlex(history=history, meta=meta, sections=sections, viewed={"2": scan})
+    sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert len(tvtime.episodes) == cap  # 40 history + 10 scan = 50 total
+    assert cap == 50
+
+
+def test_scan_auth_error_sets_backoff(tmp_path):
+    """Auth error during the scan pass backs off, same ladder as history."""
+    state = seeded_state(tmp_path)
+    sections = {"TV Shows": {"key": "2", "type": "show"}}
+    viewed = {"2": [viewed_entry("808", 3000, "2")]}
+
+    class AuthFailTVTime(FakeTVTime):
+        def mark_episode(self, eid, rewatch=False):
+            raise TVTimeAuthError("401 in scan")
+
+    tvtime = AuthFailTVTime()
+    plex = FakePlex(history=[], meta={"808": ep_item(tvdb="555")}, sections=sections, viewed=viewed)
+    sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert tvtime.backoff_set is True
+    assert json.loads((tmp_path / "state.json").read_text())["watermark"] == 1000
+
+
+def test_sections_fetched_once_when_both_exclusions_and_scan(tmp_path):
+    """sections() is called at most once per run even with exclusions + scan both active."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sections = {"Adult": {"key": "9", "type": "movie"}, "TV Shows": {"key": "2", "type": "show"}}
+    viewed = {"2": [viewed_entry("808", 3000, "2")]}
+    plex = FakePlex(history=[], meta={"808": ep_item(tvdb="555")}, sections=sections, viewed=viewed)
+    sync_mod.run(cfg=FakeCfg(excluded_libraries=["Adult"]), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert plex.sections_calls == 1  # reused, not fetched twice
