@@ -6,7 +6,7 @@ import time
 import requests
 
 from . import config as config_mod
-from .plex_client import OWNER_ACCOUNT_ID, PlexClient, PlexNotFound
+from .plex_client import OWNER_ACCOUNT_ID, PlexClient, PlexError, PlexNotFound
 from .state import OVERLAP_SECONDS, State
 from .tvtime_client import TVTimeAuthError, TVTimeClient, TVTimeError
 
@@ -15,6 +15,41 @@ CALL_SPACING_SECONDS = 1.0
 MOVIE_GUID_ORDER = ("tvdb", "tmdb", "imdb")
 
 log = logging.getLogger("plex-tvtime-sync")
+
+
+def _resolve_show_tvdb(plex, grandparent_rating_key, cache) -> str | None:
+    """Resolve a show's tvdb id from its grandparent ratingKey, memoized per run so a
+    binge of one show costs at most one extra metadata fetch. Returns None (and caches
+    None) when the grandparent is missing or has no tvdb guid."""
+    if grandparent_rating_key is None:
+        return None
+    if grandparent_rating_key in cache:
+        return cache[grandparent_rating_key]
+    try:
+        show = plex.metadata(grandparent_rating_key)
+        tvdb = show.guids.get("tvdb")
+    except (PlexNotFound, PlexError, requests.RequestException) as e:
+        log.warning("mark-previous: show id resolution failed for %s: %s", grandparent_rating_key, e)
+        tvdb = None
+    cache[grandparent_rating_key] = tvdb
+    return tvdb
+
+
+def _catch_up_previous(plex, tvtime, item, episode_tvdb, cache) -> None:
+    """Bulk-mark every prior episode of the show up to this one (first-watch only).
+    Swallows resolution + transient failures (the episode itself was already marked,
+    so we never retry the whole item just for the catch-up). Re-raises only
+    TVTimeAuthError, which the caller must treat as the standard auth break path."""
+    show_tvdb = _resolve_show_tvdb(plex, item.grandparent_rating_key, cache)
+    if not show_tvdb:
+        return  # already logged in resolver; skip catch-up, item still counts as processed
+    try:
+        tvtime.mark_previous_episodes(show_tvdb, episode_tvdb)
+        log.info("marked previous episodes of show tvdb %s up to episode %s", show_tvdb, episode_tvdb)
+    except TVTimeAuthError:
+        raise  # caller marks the (already-marked) episode processed, then backs off + breaks
+    except (TVTimeError, requests.RequestException) as e:
+        log.warning("mark-previous catch-up failed (non-fatal) for show tvdb %s: %s", show_tvdb, e)
 
 
 def run(cfg=None, plex=None, tvtime=None, state=None, sleep=time.sleep) -> int:
@@ -67,6 +102,9 @@ def run(cfg=None, plex=None, tvtime=None, state=None, sleep=time.sleep) -> int:
         key=lambda e: e.viewed_at,
     )[:MAX_ITEMS_PER_RUN]
 
+    mark_previous = bool(cfg and cfg.mark_previous_episodes)
+    show_tvdb_cache: dict[str, str | None] = {}  # grandparent_rating_key -> show tvdb (per run)
+
     for entry in todo:
         try:
             item = plex.metadata(entry.rating_key)
@@ -89,6 +127,15 @@ def run(cfg=None, plex=None, tvtime=None, state=None, sleep=time.sleep) -> int:
                 tvtime.mark_episode(tvdb_id, rewatch=rewatch)
                 state.record_mark("episodes", tvdb_id)
                 log.info("marked episode%s: %s (tvdb %s)", " [rewatch]" if rewatch else "", item.label(), tvdb_id)
+                if mark_previous and not rewatch:
+                    # primary mark succeeded -> catch up prior episodes (first watch only).
+                    # The episode is already marked, so on auth failure we must record it
+                    # processed BEFORE the standard backoff break, never re-mark it.
+                    try:
+                        _catch_up_previous(plex, tvtime, item, tvdb_id, show_tvdb_cache)
+                    except TVTimeAuthError:
+                        state.mark_processed(entry.dedup_key, entry.viewed_at)
+                        raise
             elif item.type == "movie":
                 uuid = None
                 for scheme in MOVIE_GUID_ORDER:

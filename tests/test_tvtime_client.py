@@ -7,6 +7,7 @@ import responses
 from plex_tvtime_sync.tvtime_client import (
     EPISODE_SIDECAR,
     LOGIN_SIDECAR,
+    MARK_PREVIOUS_SIDECAR,
     MINT_SIDECAR,
     MOVIE_SIDECAR,
     REFRESH_SIDECAR,
@@ -108,6 +109,27 @@ def test_mark_movie_posts_to_tracking(tmp_path):
     c.mark_movie("M-1")
 
 
+@responses.activate
+def test_mark_previous_episodes_request_shape(tmp_path):
+    url = MARK_PREVIOUS_SIDECAR.format(show_id="349", eid="349232")
+    responses.post(url, json={"result": "OK"})
+    c = make_client(tmp_path, {"jwt_token": "JWT1"})
+    c.mark_previous_episodes("349", "349232")
+    req = responses.calls[0].request
+    assert req.headers["Authorization"] == "Bearer JWT1"
+    assert req.headers["Host"] == "app.tvtime.com:80"
+    assert "watched_episodes/show/349/until/episode/349232" in req.url
+    assert json.loads(req.body) == {"username": "u@example.com", "password": "pw"}
+
+
+def test_mark_previous_sidecar_url_pins_upstream():
+    # exact wire format: until-episode bulk-mark endpoint
+    assert MARK_PREVIOUS_SIDECAR.format(show_id="S", eid="E") == (
+        "https://app.tvtime.com/sidecar?o="
+        "https://api2.tozelabs.com/v2/watched_episodes/show/S/until/episode/E"
+    )
+
+
 def test_backoff_marker_roundtrip(tmp_path):
     c = make_client(tmp_path)
     assert c.in_backoff() is False
@@ -146,6 +168,17 @@ def test_login_malformed_200_raises_auth_error(tmp_path):
     c = make_client(tmp_path)
     with pytest.raises(TVTimeAuthError):
         c.login_with_bootstrap("BOOT")
+
+
+@responses.activate
+def test_refresh_non_json_raises_auth_error(tmp_path):
+    # 401 on the call triggers refresh; refresh returns 200 but non-JSON body
+    responses.post(EPISODE_SIDECAR.format(eid="1", rw=0), status=401)
+    responses.post(REFRESH_SIDECAR, body="<html>not json</html>")
+    responses.post(MINT_SIDECAR, status=500)  # relogin fallback also fails -> auth error
+    c = make_client(tmp_path, {"jwt_token": "OLD", "jwt_refresh_token": "RT1"})
+    with pytest.raises(TVTimeAuthError):
+        c.mark_episode("1")
 
 
 @responses.activate

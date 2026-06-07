@@ -20,6 +20,7 @@ class FakePlex:
         self._viewed = viewed or {}  # {section_id: [HistoryEntry, ...]}
         self.sections_calls = 0
         self.viewed_calls = []
+        self.metadata_calls = []
 
     def recent_history(self):
         if self.history_error:
@@ -27,6 +28,7 @@ class FakePlex:
         return self.history
 
     def metadata(self, rating_key):
+        self.metadata_calls.append(rating_key)
         if rating_key not in self.meta:
             raise PlexNotFound(rating_key)
         return self.meta[rating_key]
@@ -43,9 +45,11 @@ class FakePlex:
 
 
 class FakeTVTime:
-    def __init__(self, fail_with=None, search_result="M-UUID"):
+    def __init__(self, fail_with=None, search_result="M-UUID", prev_fail_with=None):
         self.episodes, self.movies, self.searches = [], [], []
+        self.previous = []  # (show_tvdb, episode_tvdb) from mark_previous_episodes
         self.fail_with = fail_with
+        self.prev_fail_with = prev_fail_with
         self.search_result = search_result
         self.backoff_set = False
         self._in_backoff = False
@@ -60,6 +64,11 @@ class FakeTVTime:
         if self.fail_with:
             raise self.fail_with
         self.episodes.append((eid, rewatch))
+
+    def mark_previous_episodes(self, show_tvdb, episode_tvdb):
+        if self.prev_fail_with:
+            raise self.prev_fail_with
+        self.previous.append((show_tvdb, episode_tvdb))
 
     def search_movie_uuid(self, q):
         self.searches.append(q)
@@ -85,6 +94,12 @@ def ep_item(tvdb="349232", grandparent_rating_key="55"):
     guids = {"tvdb": tvdb} if tvdb else {}
     return MediaItem(type="episode", guids=guids, title="Pilot", grandparent_title="Show",
                      season=1, episode=3, grandparent_rating_key=grandparent_rating_key)
+
+
+def show_item(tvdb="349"):
+    """The grandparent (show) MediaItem that resolves an episode's show-level tvdb id."""
+    guids = {"tvdb": tvdb} if tvdb else {}
+    return MediaItem(type="show", guids=guids, title="Show")
 
 
 class FakeCfg:
@@ -362,3 +377,117 @@ def test_excluded_name_not_in_sections_is_ignored(tmp_path):
     sync_mod.run(cfg=FakeCfg(excluded_libraries=["Nonexistent"]), plex=plex, tvtime=tvtime,
                  state=state, sleep=lambda s: None)
     assert tvtime.episodes == [("349232", False)]
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: MARK_PREVIOUS_EPISODES
+# ---------------------------------------------------------------------------
+
+def test_mark_previous_fires_on_first_watch(tmp_path):
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    plex = FakePlex(history=[ep_entry()], meta={"101": ep_item(), "55": show_item("349")})
+    sync_mod.run(cfg=FakeCfg(mark_previous_episodes=True), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]
+    assert tvtime.previous == [("349", "349232")]  # show tvdb + episode tvdb
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert "101:2000" in saved["processed"]  # episode still marked processed
+
+
+def test_mark_previous_not_on_rewatch(tmp_path):
+    state = seeded_state(tmp_path)
+    state.record_mark("episodes", "349232")  # already seen → rewatch
+    tvtime = FakeTVTime()
+    plex = FakePlex(history=[ep_entry()], meta={"101": ep_item(), "55": show_item("349")})
+    sync_mod.run(cfg=FakeCfg(mark_previous_episodes=True), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", True)]
+    assert tvtime.previous == []  # rewatch must not trigger catch-up
+
+
+def test_mark_previous_off_by_default(tmp_path):
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    plex = FakePlex(history=[ep_entry()], meta={"101": ep_item(), "55": show_item("349")})
+    sync_mod.run(cfg=FakeCfg(mark_previous_episodes=False), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.previous == []
+    assert plex.metadata_calls == ["101"]  # no grandparent fetch when feature off
+
+
+def test_mark_previous_cfg_none_does_nothing(tmp_path):
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    plex = FakePlex(history=[ep_entry()], meta={"101": ep_item(), "55": show_item("349")})
+    sync_mod.run(plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert tvtime.previous == []
+
+
+def test_mark_previous_show_resolution_failure_still_processes(tmp_path):
+    """Grandparent missing from Plex → catch-up skipped, episode still counts as processed."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    # no "55" in meta → metadata(grandparent) raises PlexNotFound
+    plex = FakePlex(history=[ep_entry()], meta={"101": ep_item()})
+    sync_mod.run(cfg=FakeCfg(mark_previous_episodes=True), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]
+    assert tvtime.previous == []
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["watermark"] == 2000  # episode marked, advanced
+
+
+def test_mark_previous_no_show_tvdb_guid_still_processes(tmp_path):
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    plex = FakePlex(history=[ep_entry()], meta={"101": ep_item(), "55": show_item(tvdb=None)})
+    sync_mod.run(cfg=FakeCfg(mark_previous_episodes=True), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.previous == []
+    assert json.loads((tmp_path / "state.json").read_text())["watermark"] == 2000
+
+
+def test_mark_previous_transient_failure_still_advances_item(tmp_path):
+    """mark_previous raises TVTimeError → warning only; item still processed, no break."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime(prev_fail_with=TVTimeError("503 on catch-up"))
+    plex = FakePlex(history=[ep_entry()], meta={"101": ep_item(), "55": show_item("349")})
+    sync_mod.run(cfg=FakeCfg(mark_previous_episodes=True), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]
+    assert tvtime.backoff_set is False
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["watermark"] == 2000
+    assert "101:2000" in saved["processed"]
+
+
+def test_mark_previous_auth_error_marks_processed_then_backs_off(tmp_path):
+    """mark_previous raises TVTimeAuthError → episode already marked, so mark_processed
+    BEFORE breaking; backoff set."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime(prev_fail_with=TVTimeAuthError("401 on catch-up"))
+    plex = FakePlex(history=[ep_entry()], meta={"101": ep_item(), "55": show_item("349")})
+    sync_mod.run(cfg=FakeCfg(mark_previous_episodes=True), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]  # primary mark happened
+    assert tvtime.backoff_set is True
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert "101:2000" in saved["processed"]  # marked processed before break
+    assert saved["watermark"] == 2000
+
+
+def test_mark_previous_caches_show_resolution_across_binge(tmp_path):
+    """A binge of one show costs exactly one extra grandparent metadata fetch."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    # 3 episodes of the same show (same grandparent 55), each distinct episode tvdb
+    history = [ep_entry(rk=str(100 + i), viewed=2000 + i) for i in range(3)]
+    meta = {str(100 + i): ep_item(tvdb=str(900 + i), grandparent_rating_key="55") for i in range(3)}
+    meta["55"] = show_item("349")
+    plex = FakePlex(history=history, meta=meta)
+    sync_mod.run(cfg=FakeCfg(mark_previous_episodes=True), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    # grandparent "55" fetched exactly once despite 3 episodes
+    assert plex.metadata_calls.count("55") == 1
+    assert len(tvtime.previous) == 3  # catch-up fired for each first-watch episode

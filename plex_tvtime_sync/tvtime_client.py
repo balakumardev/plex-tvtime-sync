@@ -17,6 +17,9 @@ REFRESH_SIDECAR = f"{BETA}/sidecar?o=https://auth.tvtime.com/v1/refresh"
 EPISODE_SIDECAR = (
     APP + "/sidecar?o=https://api2.tozelabs.com/v2/watched_episodes/episode/{eid}&is_rewatch={rw}"
 )
+MARK_PREVIOUS_SIDECAR = (
+    APP + "/sidecar?o=https://api2.tozelabs.com/v2/watched_episodes/show/{show_id}/until/episode/{eid}"
+)
 SEARCH_SIDECAR = APP + "/sidecar?o=https://search.tvtime.com/v1/search/series,movie&q={q}&offset=0&limit=5"
 MOVIE_SIDECAR = APP + "/sidecar?o=https://msapi.tvtime.com/prod/v1/tracking/{uuid}/watch"
 MINT_SIDECAR = (
@@ -106,7 +109,10 @@ class TVTimeClient:
             raise TVTimeAuthError(f"refresh request failed: {e}") from e
         if r.status_code != 200:
             raise TVTimeAuthError(f"refresh rejected: HTTP {r.status_code}")
-        data = r.json().get("data") or {}
+        try:
+            data = r.json().get("data") or {}
+        except ValueError as e:
+            raise TVTimeAuthError(f"refresh returned non-JSON: {e}") from e
         if "jwt_token" not in data:
             raise TVTimeAuthError("refresh response missing jwt_token")
         self.tokens["jwt_token"] = data["jwt_token"]
@@ -169,6 +175,10 @@ class TVTimeClient:
     # ---- public API ----
     def mark_episode(self, tvdb_episode_id: str, rewatch: bool = False) -> None:
         self._post(EPISODE_SIDECAR.format(eid=tvdb_episode_id, rw=1 if rewatch else 0))
+
+    def mark_previous_episodes(self, tvdb_show_id: str, tvdb_episode_id: str) -> None:
+        """Bulk-mark every episode of the show up to (and including) the given one."""
+        self._post(MARK_PREVIOUS_SIDECAR.format(show_id=tvdb_show_id, eid=tvdb_episode_id))
 
     def search_movie_uuid(self, query: str) -> str | None:
         r = self._authed(
