@@ -6,6 +6,12 @@ from dataclasses import dataclass
 import requests
 
 
+class PlexError(Exception):
+    """Malformed/unexpected Plex response (e.g. non-XML body). Treated as transient
+    by the orchestrator — same as network errors — since the common cause is a
+    server hiccup, not a persistently corrupt item."""
+
+
 class PlexNotFound(Exception):
     pass
 
@@ -26,7 +32,7 @@ class HistoryEntry:
 @dataclass
 class MediaItem:
     type: str
-    guids: dict
+    guids: dict[str, str]
     title: str
     grandparent_title: str | None = None
     season: int | None = None
@@ -50,8 +56,12 @@ class PlexClient:
         if r.status_code == 404:
             raise PlexNotFound(path)
         r.raise_for_status()
-        return ET.fromstring(r.text)
+        try:
+            return ET.fromstring(r.text)
+        except ET.ParseError as e:
+            raise PlexError(f"non-XML response from {path}: {e}") from e
 
+    # account_id=1 is always the Plex server owner; this tool is deliberately owner-only.
     def recent_history(self, account_id: int = 1, limit: int = 200) -> list[HistoryEntry]:
         """Most recent view events, newest first. Entries without ratingKey (deleted items
         whose metadata is gone) are skipped — they cannot be resolved to GUIDs anyway."""

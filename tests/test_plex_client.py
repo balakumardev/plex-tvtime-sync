@@ -12,6 +12,8 @@ HISTORY_XML = """<?xml version="1.0" encoding="UTF-8"?>
          title="Pilot" grandparentTitle="Some Show" type="episode" viewedAt="2000" accountID="1"/>
   <Video historyKey="/status/sessions/history/2" ratingKey="202" key="/library/metadata/202"
          title="Some Movie" type="movie" viewedAt="3000" accountID="1"/>
+  <Track historyKey="/status/sessions/history/4" ratingKey="900" key="/library/metadata/900"
+         title="Some Song" type="track" viewedAt="2700" accountID="1"/>
   <Video historyKey="/status/sessions/history/3" title="Ghost entry (deleted)" type="episode"
          viewedAt="2500" accountID="1"/>
 </MediaContainer>"""
@@ -64,3 +66,12 @@ def test_metadata_empty_container_raises_not_found():
     )
     with pytest.raises(PlexNotFound):
         PlexClient(BASE, "tok").metadata("998")
+
+
+@responses.activate
+def test_non_xml_response_raises_plex_error():
+    from plex_tvtime_sync.plex_client import PlexError
+
+    responses.get(f"{BASE}/library/metadata/997", body="<html>502 Bad Gateway</html")
+    with pytest.raises(PlexError):
+        PlexClient(BASE, "tok").metadata("997")
