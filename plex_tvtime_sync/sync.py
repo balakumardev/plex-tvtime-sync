@@ -38,6 +38,22 @@ def run(cfg=None, plex=None, tvtime=None, state=None, sleep=time.sleep) -> int:
         log.error("plex history fetch failed: %s", e)
         return 0
 
+    # sections() is fetched at most once per run and shared by the excluded-library
+    # resolution and the lastViewedAt scan pass. _sections is None until first fetched.
+    sections: dict | None = None
+    excluded_ids: set[str] = set()
+    if cfg is not None and cfg.excluded_libraries:
+        # Fail closed: if we cannot resolve excluded sections, never risk syncing a
+        # private library. Bail out entirely with the watermark untouched.
+        try:
+            sections = plex.sections()
+        except Exception as e:
+            log.error("excluded-library resolution failed (%s) - skipping run to stay fail-closed", e)
+            return 0
+        excluded_ids = {
+            sections[title]["key"] for title in cfg.excluded_libraries if title in sections
+        }
+
     cutoff = state.watermark - OVERLAP_SECONDS
     todo = sorted(
         (
@@ -45,6 +61,7 @@ def run(cfg=None, plex=None, tvtime=None, state=None, sleep=time.sleep) -> int:
             for e in entries
             if e.viewed_at >= cutoff
             and e.account_id == OWNER_ACCOUNT_ID
+            and e.library_section_id not in excluded_ids
             and not state.is_processed(e.dedup_key)
         ),
         key=lambda e: e.viewed_at,

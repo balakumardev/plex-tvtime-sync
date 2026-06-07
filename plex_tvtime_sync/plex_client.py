@@ -26,6 +26,7 @@ class HistoryEntry:
     account_id: int
     title: str
     type: str  # "episode" | "movie"
+    library_section_id: str | None = None
 
     @property
     def dedup_key(self) -> str:
@@ -40,6 +41,7 @@ class MediaItem:
     grandparent_title: str | None = None
     season: int | None = None
     episode: int | None = None
+    grandparent_rating_key: str | None = None
 
     def label(self) -> str:
         if self.type == "episode" and self.grandparent_title:
@@ -90,6 +92,52 @@ class PlexClient:
                     account_id=int(v.get("accountID", 0)),
                     title=v.get("title", ""),
                     type=v.get("type", ""),
+                    library_section_id=v.get("librarySectionID"),
+                )
+            )
+        return out
+
+    def sections(self) -> dict[str, dict]:
+        """Map library section title → {"key": <section id>, "type": <plex type>}.
+        All section types are included (movie, show, artist, photo, ...); callers
+        decide which types they care about. Used for excluded-library resolution and
+        the lastViewedAt scan pass."""
+        root = self._get("/library/sections")
+        out: dict[str, dict] = {}
+        for d in root.findall("Directory"):
+            key, title = d.get("key"), d.get("title")
+            if not key or not title:
+                continue
+            out[title] = {"key": key, "type": d.get("type", "")}
+        return out
+
+    def recently_viewed(self, section_id: str, plex_type: int, limit: int = 100) -> list[HistoryEntry]:
+        """Most recently viewed items in a section (manual marks included), newest first.
+        plex_type: 4 = episodes, 1 = movies. lastViewedAt stands in for viewedAt."""
+        root = self._get(
+            f"/library/sections/{section_id}/all",
+            **{
+                "type": plex_type,
+                "sort": "lastViewedAt:desc",
+                "X-Plex-Container-Start": 0,
+                "X-Plex-Container-Size": limit,
+            },
+        )
+        out: list[HistoryEntry] = []
+        for v in root.findall("Video"):
+            rating_key, last_viewed = v.get("ratingKey"), v.get("lastViewedAt")
+            if not rating_key or not last_viewed:
+                continue
+            if v.get("type") not in ("episode", "movie"):
+                continue
+            out.append(
+                HistoryEntry(
+                    rating_key=rating_key,
+                    viewed_at=int(last_viewed),
+                    account_id=OWNER_ACCOUNT_ID,  # library state is the owner's view
+                    title=v.get("title", ""),
+                    type=v.get("type", ""),
+                    library_section_id=section_id,
                 )
             )
         return out
@@ -112,4 +160,5 @@ class PlexClient:
             grandparent_title=v.get("grandparentTitle"),
             season=int(v.get("parentIndex")) if v.get("parentIndex") else None,
             episode=int(v.get("index")) if v.get("index") else None,
+            grandparent_rating_key=v.get("grandparentRatingKey"),
         )

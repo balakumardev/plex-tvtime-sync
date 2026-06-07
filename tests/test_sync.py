@@ -10,10 +10,16 @@ from plex_tvtime_sync.tvtime_client import TVTimeAuthError, TVTimeError
 
 
 class FakePlex:
-    def __init__(self, history=None, meta=None, history_error=None):
+    def __init__(self, history=None, meta=None, history_error=None,
+                 sections=None, sections_error=None, viewed=None):
         self.history = history or []
         self.meta = meta or {}
         self.history_error = history_error
+        self._sections = sections if sections is not None else {}
+        self.sections_error = sections_error
+        self._viewed = viewed or {}  # {section_id: [HistoryEntry, ...]}
+        self.sections_calls = 0
+        self.viewed_calls = []
 
     def recent_history(self):
         if self.history_error:
@@ -24,6 +30,16 @@ class FakePlex:
         if rating_key not in self.meta:
             raise PlexNotFound(rating_key)
         return self.meta[rating_key]
+
+    def sections(self):
+        self.sections_calls += 1
+        if self.sections_error:
+            raise self.sections_error
+        return self._sections
+
+    def recently_viewed(self, section_id, plex_type, limit=100):
+        self.viewed_calls.append((section_id, plex_type))
+        return self._viewed.get(section_id, [])
 
 
 class FakeTVTime:
@@ -60,13 +76,22 @@ def seeded_state(tmp_path, watermark=1000):
     return State(tmp_path)
 
 
-def ep_entry(rk="101", viewed=2000):
-    return HistoryEntry(rating_key=rk, viewed_at=viewed, account_id=1, title="Pilot", type="episode")
+def ep_entry(rk="101", viewed=2000, section_id=None):
+    return HistoryEntry(rating_key=rk, viewed_at=viewed, account_id=1, title="Pilot",
+                        type="episode", library_section_id=section_id)
 
 
-def ep_item(tvdb="349232"):
+def ep_item(tvdb="349232", grandparent_rating_key="55"):
     guids = {"tvdb": tvdb} if tvdb else {}
-    return MediaItem(type="episode", guids=guids, title="Pilot", grandparent_title="Show", season=1, episode=3)
+    return MediaItem(type="episode", guids=guids, title="Pilot", grandparent_title="Show",
+                     season=1, episode=3, grandparent_rating_key=grandparent_rating_key)
+
+
+class FakeCfg:
+    """Stand-in for config.Config; only the fields sync.run reads from cfg."""
+    def __init__(self, excluded_libraries=None, mark_previous_episodes=False):
+        self.excluded_libraries = excluded_libraries or []
+        self.mark_previous_episodes = mark_previous_episodes
 
 
 def test_first_run_only_initializes(tmp_path):
@@ -266,3 +291,74 @@ def test_other_account_history_ignored(tmp_path):
     sync_mod.run(plex=FakePlex(history=[other], meta={"500": ep_item()}), tvtime=tvtime,
                  state=state, sleep=lambda s: None)
     assert tvtime.episodes == []
+
+
+# ---------------------------------------------------------------------------
+# Feature 1: EXCLUDED_LIBRARIES
+# ---------------------------------------------------------------------------
+
+def test_cfg_none_never_calls_sections(tmp_path):
+    """Legacy path (cfg=None) must not resolve sections at all."""
+    class NoSectionsPlex(FakePlex):
+        def sections(self):
+            raise AssertionError("sections() must not be called when cfg is None")
+
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    plex = NoSectionsPlex(history=[ep_entry()], meta={"101": ep_item()})
+    sync_mod.run(plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]
+
+
+def test_no_exclusions_configured_skips_sections(tmp_path):
+    """Empty excluded_libraries → no sections() call (history pass only)."""
+    class NoSectionsPlex(FakePlex):
+        def sections(self):
+            raise AssertionError("sections() must not be called with empty exclusions")
+
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    plex = NoSectionsPlex(history=[ep_entry()], meta={"101": ep_item()})
+    sync_mod.run(cfg=FakeCfg(excluded_libraries=[]), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]
+
+
+def test_excluded_library_invisible_to_history_pass(tmp_path):
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    # entry in section 9 ("Adult") must be silently skipped; entry in section 2 synced
+    private = ep_entry(rk="700", viewed=2050, section_id="9")
+    public = ep_entry(rk="101", viewed=2000, section_id="2")
+    sections = {"Adult": {"key": "9", "type": "movie"}, "TV Shows": {"key": "2", "type": "show"}}
+    plex = FakePlex(history=[private, public], meta={"101": ep_item(), "700": ep_item(tvdb="999")},
+                    sections=sections)
+    sync_mod.run(cfg=FakeCfg(excluded_libraries=["Adult"]), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]  # only the public one
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert "700:2050" not in saved["processed"]  # excluded item never marked processed
+
+
+def test_sections_error_with_exclusions_fails_closed(tmp_path):
+    """If sections() raises while exclusions are configured: return 0, watermark frozen."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    plex = FakePlex(history=[ep_entry(section_id="2")], meta={"101": ep_item()},
+                    sections_error=RuntimeError("plex sections down"))
+    rc = sync_mod.run(cfg=FakeCfg(excluded_libraries=["Adult"]), plex=plex, tvtime=tvtime,
+                      state=state, sleep=lambda s: None)
+    assert rc == 0
+    assert tvtime.episodes == []  # nothing synced
+    assert json.loads((tmp_path / "state.json").read_text())["watermark"] == 1000  # frozen
+
+
+def test_excluded_name_not_in_sections_is_ignored(tmp_path):
+    """An excluded library name that doesn't match any section excludes nothing."""
+    state = seeded_state(tmp_path)
+    tvtime = FakeTVTime()
+    sections = {"TV Shows": {"key": "2", "type": "show"}}
+    plex = FakePlex(history=[ep_entry(section_id="2")], meta={"101": ep_item()}, sections=sections)
+    sync_mod.run(cfg=FakeCfg(excluded_libraries=["Nonexistent"]), plex=plex, tvtime=tvtime,
+                 state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", False)]
