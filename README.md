@@ -4,7 +4,7 @@ Sync your Plex watch activity (TV episodes and movies) to [TV Time](https://tvti
 
 ## Why not webhooks?
 
-Plex webhooks require a Plex Pass; polling the history API requires nothing. Polling also self-heals: because the watermark only advances past items that succeed, anything watched while your host or TV Time was unreachable is picked up on the next successful run. Note that Plex's history endpoint records **playback sessions only**: manually marking an item watched does not create a history entry and is deliberately not synced (if you use watched-state for library cleanup automation, those marks will not pollute your TV Time profile).
+Plex webhooks require a Plex Pass; polling the history API requires nothing. Polling also self-heals: because the watermark only advances past items that succeed, anything watched while your host or TV Time was unreachable is picked up on the next successful run. Plex's history endpoint records **playback sessions only**, so a second pass scans each library's `lastViewedAt` to also pick up items you marked watched by hand (see "Manual marks sync too" below). If you use watched-state for library cleanup automation and do not want those marks reaching TV Time, put the relevant libraries in `EXCLUDED_LIBRARIES`.
 
 ## How it works
 
@@ -16,7 +16,10 @@ cron → run.sh → sync.py
        GET /library/metadata/{ratingKey}  → GUIDs, type, season/episode
        episode → tvdb id → mark episode watched on TV Time
        movie   → search TV Time (tvdb, then tmdb, then imdb) → uuid → mark watched
-  4. write state.json + ledger.json
+  4. scan pass: GET /library/sections/{id}/all?sort=lastViewedAt:desc per
+     show/movie library → sync items marked watched by hand (same pipeline,
+     same per-run cap); a normal playback dedupes against step 3.
+  5. write state.json + ledger.json
 ```
 
 TV Time is TVDB-native for shows, so the `tvdb://` GUID Plex already exposes **is** the TV Time episode id, with no mapping layer. Episodes that lack a `tvdb` GUID are skipped (TV Time cannot represent them). Legacy Plex agents (`com.plexapp.agents.*`) do not produce the modern `tvdb://` GUIDs and are not supported, so use the current Plex TV Series / Plex Movie agents.
@@ -28,6 +31,7 @@ All TV Time write calls tunnel through TV Time's own CORS sidecar (`/sidecar?o=<
 | Anonymous bootstrap mint | `api2.tozelabs.com/v2/user` (zero-auth, zero-body POST; response carries the bootstrap `jwt_token`) |
 | Credential login | `auth.tvtime.com/v1/login` (body `{username, password}`, bearer = bootstrap JWT) |
 | Mark episode watched | `api2.tozelabs.com/v2/watched_episodes/episode/{tvdb_episode_id}?is_rewatch=0|1` |
+| Mark previous episodes | `api2.tozelabs.com/v2/watched_episodes/show/{tvdb_show_id}/until/episode/{tvdb_episode_id}` |
 | Movie search | `search.tvtime.com/v1/search/series,movie?q={id}&offset=0&limit=5` |
 | Mark movie watched | `msapi.tvtime.com/prod/v1/tracking/{uuid}/watch` |
 
@@ -48,6 +52,14 @@ PLEX_URL=http://YOUR_PLEX_HOST:32400
 PLEX_TOKEN=YOUR_PLEX_TOKEN
 TVTIME_USER=you@example.com
 TVTIME_PASSWORD=your-password
+
+# Optional. When true, a first watch of an episode also bulk-marks every earlier
+# episode of that show as watched on TV Time (one-time catch-up). Default false.
+MARK_PREVIOUS_EPISODES=false
+
+# Optional. Comma-separated Plex library names to never sync (privacy filter).
+# Items in these libraries are skipped by both the history and the manual-mark scan.
+EXCLUDED_LIBRARIES=
 ```
 
 ```bash
@@ -92,7 +104,9 @@ All live in the config directory and are gitignored:
 ## Behavior and limitations
 
 - **Owner account only.** Syncs the Plex server owner (`accountID=1`); managed and shared users are ignored.
-- **Playback only.** Manually marking an item watched in Plex does not create a history entry and is not synced.
+- **Manual marks sync too.** Marking an item watched by hand does not create a playback history entry, so a second pass scans each show/movie library's `lastViewedAt` and syncs those marks as well. If you mark items watched purely to drive library cleanup automation, exclude those libraries (see below) so the marks do not reach TV Time.
+- **Excluded libraries.** Library names listed in `EXCLUDED_LIBRARIES` are never synced by either pass. Resolution is fail-closed: if Plex cannot return the library list on a given run, that run does nothing rather than risk syncing a private library.
+- **Mark previous episodes.** With `MARK_PREVIOUS_EPISODES=true`, the first watch of an episode also bulk-marks every earlier episode of that show as watched on TV Time (handy after binging outside Plex). It fires on first watches only, never on rewatches, and a failure of the catch-up never blocks the episode that was actually watched.
 - **Forward-only.** No historical backfill; the watermark starts at the time of the first run.
 - **Rewatches.** A repeat view of something already in the local ledger is sent with `is_rewatch=1`.
 - **Rate-limited.** At most 50 items per run, with at least 1 second between TV Time calls, so a large catch-up never floods the API.
@@ -106,7 +120,7 @@ All live in the config directory and are gitignored:
 ./venv/bin/pytest
 ```
 
-The suite is 50 tests, all HTTP mocked (`responses`): GUID extraction precedence, watermark and overlap dedup, ledger and rewatch flagging, and the exact TV Time request shapes (URL, headers, body) for login, episode mark, movie search, and movie mark, including the auth-failure path.
+The suite is 89 tests, all HTTP mocked (`responses`): GUID extraction precedence, watermark and overlap dedup, ledger and rewatch flagging, config parsing, the excluded-library and lastViewedAt scan passes, and the exact TV Time request shapes (URL, headers, body) for login, episode mark, mark-previous, movie search, and movie mark, including the auth-failure path.
 
 ## Credits and license
 

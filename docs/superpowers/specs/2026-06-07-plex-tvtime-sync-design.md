@@ -181,3 +181,19 @@ Deviations and discoveries from the live build, superseding the sections above w
    unlogged), tokens written 0600-from-birth.
 5. The legacy `o=` sidecar form used by the client still works (the web app itself moved to
    `o_b64=`); if `o=` ever breaks, switch the constants to base64 form.
+6. **Three opt-in/behavioral additions (post-launch).** (a) `EXCLUDED_LIBRARIES` (comma-separated
+   Plex library names): items in those libraries are filtered out of both passes; section ids are
+   resolved once per run via `GET /library/sections`, and resolution is fail-closed (any error on
+   that call aborts the run with the watermark untouched, so a private library can never be synced
+   because resolution failed). (b) `MARK_PREVIOUS_EPISODES` (bool): on a first-watch episode mark,
+   bulk-mark all earlier episodes of the show via
+   `watched_episodes/show/{show}/until/episode/{eid}`, resolving the show's tvdb id from the
+   episode's `grandparentRatingKey` with a per-run cache; catch-up failures are non-fatal (the
+   watched episode still counts as processed). (c) **Manual mark-as-watched now syncs** (reversing
+   note 1): because `/:/scrobble` only bumps the item's `lastViewedAt`/`viewCount` and writes no
+   history entry, a second pass scans each show/movie library with
+   `sort=lastViewedAt:desc` and runs the same per-item pipeline. A normal playback has
+   `lastViewedAt == viewedAt`, so the scan sees those as already-processed and never double-marks;
+   `MAX_ITEMS_PER_RUN` became a total across both passes. The scan runs only when the history pass
+   completed without a transient/auth break. `sections()` was changed to return
+   `{title: {"key", "type"}}` so the scan can pick the per-section Plex type.
