@@ -58,11 +58,18 @@ def _catch_up_previous(plex, tvtime, item, episode_tvdb, cache) -> None:
         log.warning("mark-previous catch-up failed (non-fatal) for show tvdb %s: %s", show_tvdb, e)
 
 
-def _process_entry(entry, plex, tvtime, state, mark_previous, show_tvdb_cache, sleep) -> str:
-    """Resolve one entry (history OR scan) to a TV Time mark. Shared by both passes so
-    they have identical metadata fetch, GUID handling, rewatch flagging, catch-up and
-    error ladder. Returns MARKED / SKIPPED / STOP; performs its own mark_processed for
-    MARKED and SKIPPED (and, for the auth-during-catch-up case, before STOP)."""
+def _process_entry(entry, plex, tvtime, state, mark_previous, show_tvdb_cache, sleep,
+                   allow_rewatch=True) -> str:
+    """Resolve one entry (history OR scan) to a TV Time mark. Shared by both passes for
+    metadata fetch, GUID handling, catch-up and the error ladder. Returns MARKED / SKIPPED
+    / STOP; performs its own mark_processed for MARKED and SKIPPED (and, for the
+    auth-during-catch-up case, before STOP).
+
+    allow_rewatch gates the one behaviour the passes do NOT share: the history pass (real
+    playback rows) may flag rewatches; the scan pass passes allow_rewatch=False, because
+    lastViewedAt only reflects watched-STATE that external tools (Trakt->Plex sync, an
+    unwatcher flipping the flag) re-stamp without any real viewing — letting it rewatch
+    produced phantom rewatches (same episode flagged a rewatch on consecutive cron ticks)."""
     try:
         item = plex.metadata(entry.rating_key)
     except PlexNotFound:
@@ -81,6 +88,13 @@ def _process_entry(entry, plex, tvtime, state, mark_previous, show_tvdb_cache, s
                 state.mark_processed(entry.dedup_key, entry.viewed_at)
                 return SKIPPED
             rewatch = state.seen_count("episodes", tvdb_id) > 0
+            if rewatch and not allow_rewatch:
+                # Scan pass only. lastViewedAt reflects watched-STATE, which external tools
+                # re-stamp with no real viewing, so a "rewatch" seen here is almost always
+                # churn, not a viewing. Record processed (so it stops re-surfacing) and skip
+                # — a genuine rewatch arrives as a real playback history row (pass 1).
+                state.mark_processed(entry.dedup_key, entry.viewed_at)
+                return SKIPPED
             tvtime.mark_episode(tvdb_id, rewatch=rewatch)
             state.record_mark("episodes", tvdb_id)
             log.info("marked episode%s: %s (tvdb %s)", " [rewatch]" if rewatch else "", item.label(), tvdb_id)
@@ -238,7 +252,9 @@ def _scan_pass(plex, tvtime, state, cutoff, excluded_ids, get_sections,
                mark_previous, show_tvdb_cache, sleep, marked_count) -> None:
     """Second detection pass: items whose lastViewedAt was bumped by a manual mark-watched
     (no playback session, so no history entry). Shares the per-entry pipeline, cutoff,
-    dedup map and per-run cap with the history pass."""
+    dedup map and per-run cap with the history pass. First-watch only: it passes
+    allow_rewatch=False, so an already-ledgered episode is never re-marked as a rewatch
+    here — watched-state churn is not a viewing (rewatches come from pass 1's history rows)."""
     try:
         sections = get_sections()
     except Exception as e:
@@ -277,7 +293,8 @@ def _scan_pass(plex, tvtime, state, cutoff, excluded_ids, get_sections,
         for entry in candidates:
             if marked_count >= MAX_ITEMS_PER_RUN:
                 return
-            outcome = _process_entry(entry, plex, tvtime, state, mark_previous, show_tvdb_cache, sleep)
+            outcome = _process_entry(entry, plex, tvtime, state, mark_previous, show_tvdb_cache,
+                                     sleep, allow_rewatch=False)
             if outcome == STOP:
                 return  # auth → backoff already set; transient → stop the scan too
             if outcome == MARKED:

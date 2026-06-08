@@ -717,17 +717,43 @@ def test_scan_skew_does_not_phantom_rewatch(tmp_path):
     assert "101:2001" in saved["processed"]  # skewed key remembered for future runs
 
 
-def test_scan_outside_overlap_window_is_genuine_rewatch(tmp_path):
-    """Inverse guard: a scan hit for the same item OUTSIDE the overlap window is a real
-    rewatch and must be marked (rewatch=True), not swallowed by the epsilon dedup."""
-    state = seeded_state(tmp_path, watermark=1000)
+# ---------------------------------------------------------------------------
+# Fix C2: the scan pass is FIRST-WATCH ONLY — it must never drive a rewatch.
+#
+# The scan reflects watched-STATE (lastViewedAt), which external tools re-stamp with no
+# real viewing: a Trakt->Plex sync re-asserting watched status, or an unwatcher flipping
+# the flag off then on. Treating each lastViewedAt bump as a fresh view produced phantom
+# rewatches (an episode marked "rewatched" 4x on consecutive 5-min cron ticks). A genuine
+# rewatch always produces a real playback -> a history row -> the history pass counts it.
+# So: scan may add a never-seen episode once; only the history pass may rewatch.
+# ---------------------------------------------------------------------------
+
+def test_scan_never_rewatches_already_watched_episode(tmp_path):
+    """An episode already in the ledger that resurfaces ONLY via the scan (lastViewedAt
+    bumped, no new history row) must NOT be re-marked as a rewatch — that was the phantom.
+    It is recorded as processed so the churn stops re-surfacing it next run."""
+    state = seeded_state(tmp_path)
+    state.record_mark("episodes", "349232")  # watched once already
     tvtime = FakeTVTime()
     sections = {"TV Shows": {"key": "2", "type": "show"}}
-    history = [ep_entry(rk="101", viewed=2000, section_id="2")]
-    later = 2000 + sync_mod.OVERLAP_SECONDS + 10  # comfortably outside the window
-    viewed = {"2": [viewed_entry("101", later, "2")]}
-    plex = FakePlex(history=history, meta={"101": ep_item()}, sections=sections, viewed=viewed)
+    # bumped well past the epsilon window — exactly the case the old code mis-read as a rewatch
+    viewed = {"2": [viewed_entry("101", 3000, "2")]}
+    plex = FakePlex(history=[], meta={"101": ep_item()}, sections=sections, viewed=viewed)
     sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
-    assert tvtime.episodes == [("349232", False), ("349232", True)]  # first watch + rewatch
+    assert tvtime.episodes == []  # no phantom rewatch from watched-state churn
     saved = json.loads((tmp_path / "state.json").read_text())
-    assert f"101:{later}" in saved["processed"]
+    assert "101:3000" in saved["processed"]  # recorded so it stops churning next run
+
+
+def test_history_rewatch_still_counts_after_unwatch_replay(tmp_path):
+    """The clean-rewatch workflow: an episode watched once (already in the ledger) is
+    re-added / marked unwatched, then actually PLAYED again -> Plex writes a fresh history
+    row. The history pass must still count that as a rewatch. Only the scan is barred from
+    rewatching; a real playback is the trusted rewatch signal."""
+    state = seeded_state(tmp_path)
+    state.record_mark("episodes", "349232")  # watched once already
+    tvtime = FakeTVTime()
+    # a brand-new playback after the unwatch: history row with a fresh viewedAt
+    plex = FakePlex(history=[ep_entry(rk="101", viewed=3000)], meta={"101": ep_item()})
+    sync_mod.run(cfg=FakeCfg(), plex=plex, tvtime=tvtime, state=state, sleep=lambda s: None)
+    assert tvtime.episodes == [("349232", True)]  # real replay -> rewatch counted
